@@ -30,16 +30,40 @@ import (
 // path).
 var ErrUnavailable = errors.New("libopenmpt: shared library not found")
 
+// SupportedExtensions lists the file extensions (lowercase, no leading dot)
+// that libopenmpt can load. This is a static snapshot of
+// openmpt_get_supported_extensions() from libopenmpt 0.8 — it's kept as a
+// plain list rather than queried live so callers (e.g. the file browser)
+// can check an extension without first loading the shared library.
+//
+// `go generate ./player/openmpt/...` reprints the live list (requires a C
+// compiler and libopenmpt's headers/lib installed) so it can be diffed
+// against the one below and copied in by hand after a libopenmpt upgrade;
+// it does not rewrite this file itself.
+//
+//go:generate sh -c "printf '#include <stdio.h>\\n#include <libopenmpt/libopenmpt.h>\\nint main(){puts(openmpt_get_supported_extensions());}' | cc -x c - -lopenmpt -o /tmp/openmpt-supported-exts && /tmp/openmpt-supported-exts"
+var SupportedExtensions = []string{
+	"mptm", "mod", "s3m", "xm", "it",
+	"667", "669", "amf", "ams", "c67", "cba", "dbm", "digi", "dmf", "dsm",
+	"dsym", "dtm", "etx", "far", "fc", "fc13", "fc14", "fmt", "fst", "ftm",
+	"imf", "ims", "ice", "j2b", "m15", "mdl", "med", "mms", "mt2", "mtm",
+	"mus", "nst", "okt", "plm", "psm", "pt36", "ptm", "puma", "rtm", "sfx",
+	"sfx2", "smod", "st26", "stk", "stm", "stx", "stp", "symmod", "tcb",
+	"gmc", "gtk", "gt2", "ult", "unic", "wow", "xmf", "gdm", "mo3", "oxm",
+	"umx", "xpk", "ppm", "mmcmp",
+}
+
 var (
 	initOnce sync.Once
 	initErr  error
 
-	fnCreateFromMemory2          func(filedata []byte, filesize uintptr, logfunc uintptr, loguser unsafe.Pointer, errfunc uintptr, erruser unsafe.Pointer, errOut *int32, errMsgOut unsafe.Pointer, ctls unsafe.Pointer) uintptr
+	fnCreateFromMemory2          func(filedata []byte, filesize uintptr, logfunc uintptr, loguser unsafe.Pointer, errfunc uintptr, erruser unsafe.Pointer, errOut *int32, errMsgOut *uintptr, ctls unsafe.Pointer) uintptr
 	fnDestroy                    func(mod uintptr)
 	fnReadInterleavedFloatStereo func(mod uintptr, samplerate int32, count uintptr, interleaved []float32) uintptr
 	fnGetDurationSeconds         func(mod uintptr) float64
 	fnGetPositionSeconds         func(mod uintptr) float64
 	fnSetPositionSeconds         func(mod uintptr, seconds float64) float64
+	fnFreeString                 func(str uintptr)
 
 	// logFunc and errFunc point at libopenmpt's own no-op log/error
 	// handlers (resolved by address, never called from Go). Passing NULL
@@ -67,6 +91,7 @@ func ensureInit() error {
 		purego.RegisterLibFunc(&fnGetDurationSeconds, handle, "openmpt_module_get_duration_seconds")
 		purego.RegisterLibFunc(&fnGetPositionSeconds, handle, "openmpt_module_get_position_seconds")
 		purego.RegisterLibFunc(&fnSetPositionSeconds, handle, "openmpt_module_set_position_seconds")
+		purego.RegisterLibFunc(&fnFreeString, handle, "openmpt_free_string")
 
 		if addr, err := dlsym(handle, "openmpt_log_func_silent"); err == nil {
 			logFunc = addr
@@ -102,11 +127,44 @@ func Open(data []byte) (*Module, error) {
 	}
 
 	var errCode int32
-	mod := fnCreateFromMemory2(data, uintptr(len(data)), logFunc, nil, errFunc, nil, &errCode, nil, nil)
+	var errMsg uintptr
+	mod := fnCreateFromMemory2(data, uintptr(len(data)), logFunc, nil, errFunc, nil, &errCode, &errMsg, nil)
 	if mod == 0 {
+		if msg := takeCString(errMsg); msg != "" {
+			return nil, fmt.Errorf("libopenmpt: %s", msg)
+		}
 		return nil, fmt.Errorf("libopenmpt: unrecognized or corrupt module file (error code %d)", errCode)
 	}
 	return &Module{mod: mod}, nil
+}
+
+// takeCString copies a NUL-terminated string libopenmpt allocated and
+// returned by pointer (as opposed to one purego already copied for us via
+// a func's string return type - see RegisterFunc's docs on that
+// conversion) into a Go string, then frees the original with
+// openmpt_free_string as libopenmpt's API requires. Returns "" for a NULL
+// pointer, or if fnFreeString itself failed to resolve (ptr == 0 is the
+// only value that's safe to leak: it means there was nothing to free).
+func takeCString(cstr uintptr) string {
+	if cstr == 0 {
+		return ""
+	}
+	defer func() {
+		if fnFreeString != nil {
+			fnFreeString(cstr)
+		}
+	}()
+
+	// Taking the address of the uintptr and reinterpreting it as
+	// *unsafe.Pointer, rather than converting cstr directly, is the same
+	// trick purego's own internal/strings.GoString uses to keep `go vet`
+	// from flagging this as a misuse of unsafe.Pointer.
+	ptr := *(*unsafe.Pointer)(unsafe.Pointer(&cstr))
+	var length int
+	for *(*byte)(unsafe.Add(ptr, uintptr(length))) != 0 {
+		length++
+	}
+	return string(unsafe.Slice((*byte)(ptr), length))
 }
 
 // ReadInterleavedFloatStereo renders up to len(buf)/2 stereo frames into buf

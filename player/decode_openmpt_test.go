@@ -5,6 +5,9 @@ import (
 	"encoding/binary"
 	"io"
 	"math"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/gopxl/beep/v2"
@@ -71,10 +74,22 @@ func (c *closeCountingReader) Close() error {
 }
 
 func TestSupportedExtsIncludesTrackerFormats(t *testing.T) {
-	for _, ext := range []string{".mod", ".s3m", ".xm", ".it", ".mptm"} {
+	if len(openmpt.SupportedExtensions) < 60 {
+		t.Fatalf("openmpt.SupportedExtensions has %d entries, want the ~67 libopenmpt reports", len(openmpt.SupportedExtensions))
+	}
+	// Spot-check the well-known formats plus a few obscure ones, to make
+	// sure the whole list — not just a hand-picked subset — made it into
+	// SupportedExts and openmptExts.
+	for _, ext := range []string{".mod", ".s3m", ".xm", ".it", ".mptm", ".umx", ".stm", ".mtm", ".okt"} {
 		if !SupportedExts[ext] {
 			t.Errorf("SupportedExts[%q] = false, want true", ext)
 		}
+		if !openmptExts[ext] {
+			t.Errorf("openmptExts[%q] = false, want true", ext)
+		}
+	}
+	if got, want := len(openmptExts), len(openmpt.SupportedExtensions); got != want {
+		t.Errorf("len(openmptExts) = %d, want %d (one entry per openmpt.SupportedExtensions)", got, want)
 	}
 }
 
@@ -110,7 +125,7 @@ func TestDecodeOpenmptStreamAndSeek(t *testing.T) {
 	}
 
 	rc := &closeCountingReader{Reader: bytes.NewReader(testModuleBytes(t))}
-	decoder, format, err := decodeOpenmpt(rc, beep.SampleRate(44100))
+	decoder, format, err := decodeOpenmpt(rc, "test.mod", beep.SampleRate(44100))
 	if err != nil {
 		t.Fatalf("decodeOpenmpt: %v", err)
 	}
@@ -173,11 +188,53 @@ func TestDecodeOpenmptRejectsCorruptFile(t *testing.T) {
 	}
 
 	rc := &closeCountingReader{Reader: bytes.NewReader([]byte("not a module"))}
-	if _, _, err := decodeOpenmpt(rc, beep.SampleRate(44100)); err == nil {
+	if _, _, err := decodeOpenmpt(rc, "test.mod", beep.SampleRate(44100)); err == nil {
 		t.Error("decodeOpenmpt on garbage bytes: got nil error, want an error")
 	}
 	if rc.closed != 1 {
 		t.Errorf("decodeOpenmpt closed the source reader %d times, want 1", rc.closed)
+	}
+}
+
+// TestBuildPipelineCorruptModuleDoesNotFallBackToFFmpeg guards against
+// buildPipeline's generic "native decoder failed, retry with ffmpeg"
+// fallback swallowing a module decode error: ffmpeg has no tracker-module
+// demuxer at all, so retrying it can only ever fail, replacing a clear
+// libopenmpt error with a confusing ffmpeg one. Modeled on
+// TestBuildPipelineNativeFallbackStreamsFFmpeg in ffmpeg_test.go, which
+// covers the case where that fallback *should* fire.
+func TestBuildPipelineCorruptModuleDoesNotFallBackToFFmpeg(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell fixtures")
+	}
+	if !openmpt.Available() {
+		t.Skip("libopenmpt not installed in this environment")
+	}
+
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "ffmpeg-args")
+	writeExecutable(t, filepath.Join(dir, "ffmpeg"), `#!/bin/sh
+printf '%s\n' "$*" >> "$FFMPEG_ARGS"
+printf '\000\100\000\300'
+`)
+	writeExecutable(t, filepath.Join(dir, "ffprobe"), `#!/bin/sh
+printf '2.5\n'
+`)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FFMPEG_ARGS", argsPath)
+
+	path := filepath.Join(dir, "corrupt.mod")
+	if err := os.WriteFile(path, []byte("not a module file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := &Player{sr: beep.SampleRate(44100), bitDepth: 16}
+	tp, err := p.buildPipeline(path)
+	if err == nil {
+		tp.close()
+		t.Fatal("buildPipeline() on a corrupt .mod file: got nil error, want the libopenmpt decode error")
+	}
+	if _, statErr := os.Stat(argsPath); statErr == nil {
+		t.Error("ffmpeg was invoked for a .mod file — it has no tracker-module support, this should never happen")
 	}
 }
 

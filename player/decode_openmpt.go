@@ -4,20 +4,45 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
+	"runtime"
 
 	"github.com/gopxl/beep/v2"
 
 	"github.com/bjarneo/cliamp/player/openmpt"
 )
 
-// decodeOpenmpt decodes a tracker module file (.mod, .s3m, .xm, .it, ...)
-// via libopenmpt. libopenmpt renders directly at the requested sample
-// rate, so no separate resampling stage is needed.
-func decodeOpenmpt(rc io.ReadCloser, sr beep.SampleRate) (beep.StreamSeekCloser, beep.Format, error) {
+// openmptExts are the tracker module extensions decoded via libopenmpt
+// (player/openmpt), derived from openmpt.SupportedExtensions. Listed
+// separately from SupportedExts so decodeWithExt can route them before
+// falling into the mp3/wav/flac/ogg switch below — and kept as a static
+// map (built once here, not on every lookup) for the same reason
+// SupportedExts itself is static: resolve.go and the file browser need to
+// answer "is this extension playable?" without loading libopenmpt just to
+// find out.
+var openmptExts = func() map[string]bool {
+	m := make(map[string]bool, len(openmpt.SupportedExtensions))
+	for _, ext := range openmpt.SupportedExtensions {
+		m["."+ext] = true
+	}
+	return m
+}()
+
+func init() {
+	for ext := range openmptExts {
+		SupportedExts[ext] = true
+	}
+}
+
+// decodeOpenmpt decodes a tracker module file via libopenmpt — .mod, .s3m,
+// .xm, .it, and the rest of openmpt.SupportedExtensions. libopenmpt
+// renders directly at the requested sample rate, so no separate
+// resampling stage is needed.
+func decodeOpenmpt(rc io.ReadCloser, path string, sr beep.SampleRate) (beep.StreamSeekCloser, beep.Format, error) {
 	defer rc.Close()
 
 	if !openmpt.Available() {
-		return nil, beep.Format{}, fmt.Errorf("libopenmpt is required to play tracker module files (.mod/.s3m/.xm/.it) — install it with your package manager (e.g. apt install libopenmpt0, brew install libopenmpt, pacman -S libopenmpt)")
+		return nil, beep.Format{}, fmt.Errorf("libopenmpt is required to play %s — install: %s (%w)", path, openmptInstallHint(), openmpt.ErrUnavailable)
 	}
 
 	data, err := io.ReadAll(rc)
@@ -33,6 +58,29 @@ func decodeOpenmpt(rc io.ReadCloser, sr beep.SampleRate) (beep.StreamSeekCloser,
 	format := beep.Format{SampleRate: sr, NumChannels: 2, Precision: 2}
 	length := int(mod.DurationSeconds() * float64(sr))
 	return &openmptStreamer{mod: mod, sampleRate: int(sr), length: length}, format, nil
+}
+
+// openmptInstallHint returns a platform-specific install command
+// suggestion, mirroring ffmpegInstallHint in ytdl.go. Windows has no
+// well-known package-manager entry for a bare shared library, so it
+// points at a direct download instead of guessing at a winget package.
+func openmptInstallHint() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "brew install libopenmpt"
+	case "linux":
+		if _, err := exec.LookPath("apt-get"); err == nil {
+			return "sudo apt install libopenmpt0"
+		}
+		if _, err := exec.LookPath("pacman"); err == nil {
+			return "sudo pacman -S libopenmpt"
+		}
+		return "see https://lib.openmpt.org/libopenmpt/"
+	case "windows":
+		return "download libopenmpt.dll from https://lib.openmpt.org/libopenmpt/ and place it next to cliamp.exe"
+	default:
+		return "see https://lib.openmpt.org/libopenmpt/"
+	}
 }
 
 // openmptStreamer adapts an *openmpt.Module to beep.StreamSeekCloser.

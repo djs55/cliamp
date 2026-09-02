@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -108,8 +109,16 @@ func TestOpenRejectsGarbage(t *testing.T) {
 		t.Skip("libopenmpt not installed in this environment")
 	}
 
-	if _, err := Open([]byte("this is not a tracker module")); err == nil {
-		t.Error("Open() on garbage bytes: got nil error, want an error")
+	_, err := Open([]byte("this is not a tracker module"))
+	if err == nil {
+		t.Fatal("Open() on garbage bytes: got nil error, want an error")
+	}
+	// libopenmpt's create_from_memory2 hands back a real, allocated error
+	// message (freed via openmpt_free_string in takeCString) - make sure
+	// that's what actually surfaces, not the "(error code N)" fallback
+	// Open uses when the message pointer comes back NULL.
+	if strings.Contains(err.Error(), "error code") {
+		t.Errorf("Open() error = %q, want libopenmpt's real error message, not the numeric-code fallback", err.Error())
 	}
 }
 
