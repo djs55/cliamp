@@ -38,6 +38,22 @@ var SupportedExts = map[string]bool{
 	".wma":  true,
 	".opus": true,
 	".webm": true,
+	".mod":  true,
+	".s3m":  true,
+	".xm":   true,
+	".it":   true,
+	".mptm": true,
+}
+
+// openmptExts are the tracker module formats decoded via libopenmpt
+// (player/openmpt). Listed separately from SupportedExts so decodeWithExt
+// can route them before falling into the mp3/wav/flac/ogg switch below.
+var openmptExts = map[string]bool{
+	".mod":  true,
+	".s3m":  true,
+	".xm":   true,
+	".it":   true,
+	".mptm": true,
 }
 
 // httpClient is the shared streaming HTTP client. See internal/httpclient
@@ -323,6 +339,9 @@ func (p *Player) isBufferedURL(path string) bool {
 func decodeWithExt(rc io.ReadCloser, ext, path string, sr beep.SampleRate, bitDepth int) (beep.StreamSeekCloser, beep.Format, error) {
 	if needsFFmpeg(ext) {
 		return decodeFFmpegLocal(path, sr, bitDepth)
+	}
+	if openmptExts[ext] {
+		return decodeOpenmpt(rc, sr)
 	}
 	switch ext {
 	case ".wav":
